@@ -1,0 +1,264 @@
+"""
+ev_requisition_dashboard.py
+
+Run:
+    pip install -r requirements.txt
+    streamlit run ev_requisition_dashboard.py
+"""
+
+import streamlit as st
+import pandas as pd
+import sqlite3
+from datetime import datetime, date
+import plotly.express as px
+import os
+from typing import List, Dict, Any
+
+DB_PATH = "ev_requisition.db"
+
+# -----------------------
+# Database helpers
+# -----------------------
+def init_db(path=DB_PATH):
+    conn = sqlite3.connect(path, check_same_thread=False)
+    cur = conn.cursor()
+    # vehicles table
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS vehicles (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT NOT NULL,
+        capacity INTEGER,
+        available INTEGER DEFAULT 1
+    )""")
+    # requests table
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS requests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        requester_name TEXT NOT NULL,
+        requester_email TEXT,
+        department TEXT,
+        vehicle_id INTEGER,
+        start_date TEXT,
+        end_date TEXT,
+        purpose TEXT,
+        passengers INTEGER,
+        status TEXT DEFAULT 'Pending',
+        created_at TEXT,
+        updated_at TEXT,
+        approver_note TEXT,
+        FOREIGN KEY(vehicle_id) REFERENCES vehicles(id)
+    )""")
+    conn.commit()
+    return conn
+
+def seed_demo_data(conn):
+    cur = conn.cursor()
+    # seed vehicles if empty
+    cur.execute("SELECT COUNT(*) FROM vehicles")
+    if cur.fetchone()[0] == 0:
+        vehicles = [
+            ("EV - Hatchback A", 4, 1),
+            ("EV - Mini Van B", 7, 1),
+            ("EV - Sedan C", 4, 1),
+        ]
+        cur.executemany("INSERT INTO vehicles (name, capacity, available) VALUES (?, ?, ?)", vehicles)
+        conn.commit()
+    # seed a request or two for demo
+    cur.execute("SELECT COUNT(*) FROM requests")
+    if cur.fetchone()[0] == 0:
+        now = datetime.now().isoformat()
+        demo_requests = [
+            ("Alice Johnson", "alice@college.edu", "Engineering", 1, "2025-11-02", "2025-11-02", "Lab equipment pickup", 2, "Approved", now, now, "OK"),
+            ("Ravi Kumar", "ravi@college.edu", "Biology", 2, "2025-11-05", "2025-11-05", "Field trip", 6, "Pending", now, now, ""),
+        ]
+        cur.executemany("""INSERT INTO requests 
+            (requester_name, requester_email, department, vehicle_id, start_date, end_date, purpose, passengers, status, created_at, updated_at, approver_note)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""", demo_requests)
+        conn.commit()
+
+# -----------------------
+# CRUD functions
+# -----------------------
+def get_vehicles(conn) -> pd.DataFrame:
+    df = pd.read_sql_query("SELECT * FROM vehicles", conn)
+    return df
+
+def get_requests(conn) -> pd.DataFrame:
+    df = pd.read_sql_query("""
+        SELECT r.*, v.name as vehicle_name
+        FROM requests r
+        LEFT JOIN vehicles v ON r.vehicle_id = v.id
+        ORDER BY created_at DESC
+    """, conn)
+    return df
+
+def add_request(conn, data: Dict[str, Any]):
+    cur = conn.cursor()
+    now = datetime.now().isoformat()
+    cur.execute("""
+        INSERT INTO requests
+        (requester_name, requester_email, department, vehicle_id, start_date, end_date, purpose, passengers, status, created_at, updated_at, approver_note)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'Pending', ?, ?, '')
+    """, (
+        data["requester_name"], data["requester_email"], data["department"],
+        data["vehicle_id"], data["start_date"], data["end_date"],
+        data["purpose"], data["passengers"], now, now
+    ))
+    conn.commit()
+
+def update_request_status(conn, req_id: int, status: str, approver_note: str = ""):
+    cur = conn.cursor()
+    now = datetime.now().isoformat()
+    cur.execute("UPDATE requests SET status = ?, approver_note = ?, updated_at = ? WHERE id = ?", (status, approver_note, now, req_id))
+    conn.commit()
+
+# -----------------------
+# Analytics / helpers
+# -----------------------
+def compute_kpis(df: pd.DataFrame) -> Dict[str, Any]:
+    total = len(df)
+    pending = (df['status'] == 'Pending').sum()
+    approved = (df['status'] == 'Approved').sum()
+    rejected = (df['status'] == 'Rejected').sum()
+    upcoming = df[pd.to_datetime(df['start_date']) >= pd.to_datetime(date.today())].shape[0]
+    return {
+        "total_requests": total,
+        "pending": pending,
+        "approved": approved,
+        "rejected": rejected,
+        "upcoming": upcoming
+    }
+
+# -----------------------
+# Streamlit UI
+# -----------------------
+def requisition_form(conn):
+    st.header("Request an EV Vehicle")
+    with st.form("req_form", clear_on_submit=True):
+        requester_name = st.text_input("Your name", value="")
+        requester_email = st.text_input("Email")
+        department = st.text_input("Department / Club")
+        vehicles = get_vehicles(conn)
+        vehicle_options = {row['name']: int(row['id']) for _, row in vehicles.iterrows()}
+        vehicle_choice = st.selectbox("Vehicle", options=list(vehicle_options.keys()))
+        start_date = st.date_input("Start date", value=date.today())
+        end_date = st.date_input("End date", value=date.today())
+        purpose = st.text_area("Purpose / Notes", max_chars=500)
+        passengers = st.number_input("Number of passengers", min_value=1, max_value=20, value=1)
+        submitted = st.form_submit_button("Submit Request")
+        if submitted:
+            data = {
+                "requester_name": requester_name.strip() or "Anonymous",
+                "requester_email": requester_email.strip(),
+                "department": department.strip(),
+                "vehicle_id": vehicle_options[vehicle_choice],
+                "start_date": start_date.isoformat(),
+                "end_date": end_date.isoformat(),
+                "purpose": purpose.strip(),
+                "passengers": int(passengers)
+            }
+            add_request(conn, data)
+            st.success("Request submitted! It will appear in the requests list.")
+
+def requests_table(conn, role="requester"):
+    st.header("Requests")
+    df = get_requests(conn)
+    if df.empty:
+        st.info("No requests yet.")
+        return
+
+    st.write(f"Showing {len(df)} requests")
+    # show table
+    display_df = df[['id','requester_name','department','vehicle_name','start_date','end_date','passengers','status','approver_note']]
+    st.dataframe(display_df.rename(columns={
+        'id':'ID','requester_name':'Name','department':'Dept','vehicle_name':'Vehicle',
+        'start_date':'Start','end_date':'End','passengers':'Pax','status':'Status','approver_note':'Approver Note'
+    }), height=300)
+
+    if role == "approver":
+        st.subheader("Approve / Reject Requests")
+        pending = df[df['status']=='Pending']
+        if pending.empty:
+            st.info("No pending requests.")
+        else:
+            for _, row in pending.iterrows():
+                with st.expander(f"Request #{row['id']} — {row['requester_name']} ({row['department']})"):
+                    st.write("*Vehicle:*", row['vehicle_name'])
+                    st.write("*Dates:*", row['start_date'], "→", row['end_date'])
+                    st.write("*Pax:*", int(row['passengers']))
+                    st.write("*Purpose:*", row['purpose'])
+                    note = st.text_area(f"Approver note for #{row['id']}", key=f"note_{row['id']}")
+                    cols = st.columns(3)
+                    if cols[0].button("Approve", key=f"approve_{row['id']}"):
+                        update_request_status(conn, int(row['id']), "Approved", note)
+                        st.success(f"Request #{row['id']} approved.")
+                    if cols[1].button("Reject", key=f"reject_{row['id']}"):
+                        update_request_status(conn, int(row['id']), "Rejected", note)
+                        st.warning(f"Request #{row['id']} rejected.")
+                    if cols[2].button("Mark as Completed", key=f"complete_{row['id']}"):
+                        update_request_status(conn, int(row['id']), "Completed", note)
+                        st.info(f"Request #{row['id']} marked completed.")
+            st.experimental_rerun()
+
+def analytics_section(conn):
+    st.header("Analytics")
+    df = get_requests(conn)
+    if df.empty:
+        st.info("No data to show analytics.")
+        return
+    kpis = compute_kpis(df)
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Total", kpis['total_requests'])
+    c2.metric("Pending", kpis['pending'])
+    c3.metric("Approved", kpis['approved'])
+    c4.metric("Rejected", kpis['rejected'])
+    # requests by status
+    fig = px.histogram(df, x='status', title="Requests by Status")
+    st.plotly_chart(fig, use_container_width=True)
+    # requests over time
+    df['created_at_dt'] = pd.to_datetime(df['created_at'])
+    df_group = df.groupby(pd.Grouper(key='created_at_dt', freq='7D')).size().reset_index(name='count')
+    if not df_group.empty:
+        fig2 = px.line(df_group, x='created_at_dt', y='count', title="Requests over time (weekly)")
+        st.plotly_chart(fig2, use_container_width=True)
+    # top departments
+    top_depts = df['department'].value_counts().reset_index()
+    top_depts.columns = ['department','count']
+    if not top_depts.empty:
+        fig3 = px.bar(top_depts, x='department', y='count', title="Requests by Department")
+        st.plotly_chart(fig3, use_container_width=True)
+
+def main():
+    st.set_page_config(page_title="College EV Requisition Dashboard", layout="wide")
+    conn = init_db()
+    seed_demo_data(conn)
+
+    st.title("🚗 College EV Requisition Dashboard")
+    st.markdown("Use this app to request, review, and analyze EV vehicle requisitions for campus activities.")
+
+    # Simple role selection for demo:
+    role = st.sidebar.selectbox("Role (demo)", ["Requester", "Approver", "Viewer"])
+    st.sidebar.markdown("*Filters*")
+    show_only_my_dept = st.sidebar.checkbox("Show only my department (demo)", value=False)
+
+    # Left column: form + requests
+    left, right = st.columns([1, 1.4])
+    with left:
+        if role == "Requester":
+            requisition_form(conn)
+        else:
+            st.info("Switch to 'Requester' role to submit a new request.")
+        requests_table(conn, role=role.lower())
+
+    with right:
+        analytics_section(conn)
+        st.markdown("---")
+        st.subheader("Vehicles")
+        vehicles = get_vehicles(conn)
+        st.table(vehicles[['id','name','capacity','available']].rename(columns={'id':'ID','name':'Vehicle','capacity':'Capacity','available':'Available'}))
+
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("App created for demonstration. Data stored in local ev_requisition.db.")
+
+if _name_ == "_main_":
+    main()
